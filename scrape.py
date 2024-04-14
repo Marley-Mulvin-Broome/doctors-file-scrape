@@ -1,42 +1,38 @@
 #!/usr/bin/env python3
 
+from concurrent.futures import ThreadPoolExecutor
+
 from bs4 import BeautifulSoup
 import xlsxwriter
 import requests
+from atomics import atomic, INT
 
-from dataclasses import dataclass
+from hospital_factory import HospitalFactory
 
 root_url = "https://doctorsfile.jp"
+output_file = "hospitals.xlsx"
 
 # 複数の対象URL
 urls = [
-    "https://doctorsfile.jp/search/ms72_pv1169_pv1170_pv1171_pv1172_pv1173_pv1174_pv1175_pv1176_pv1177_pv1178_pv1179_pv1180_pv1181_pv1182_pv1183_pv1184_pv1185_pv1186_pv1187_pv1188_pv1189_pv1190_pv1191_pv1192_pv1193_pv1194_pv1195_pv1196_pv1197_pv1198_pv1199_pv1200_pv1201_pv1202_pv1203_pv1204/"
+    "https://doctorsfile.jp/search/ms1/"
     ]
 
-pages = [ 1 ]
+visited_pages = { 1: "" }
 
-@dataclass
-class Hospital:
-    name: str
-    address: str
-    phone: str
-    station: str
-    department: str
+all_hospitals = []
 
-    def write_to_worksheet(self, worksheet, row):
-        worksheet.write(f'A{row}', self.name)
-        worksheet.write(f'B{row}', self.address)
-        worksheet.write(f'C{row}', self.phone)
-        worksheet.write(f'D{row}', self.station)
-        worksheet.write(f'E{row}', self.department)
+current_hospitals = atomic(width=4, atype=INT)
+max_hospitals = atomic(width=4, atype=INT)
 
-    def __str__(self):
-        return f"{self.name}, {self.address}, {self.phone}, {self.station}, {self.department}"
+def get_progress_bar(current_value, max_value, progress_width) -> str:
+    progress = current_value / max_value
+    filled_width = int(progress * progress_width)
+    bar = '#' * filled_width + '-' * (progress_width - filled_width)
+    percentage = int(progress * 100)
+    return f"{current_value}/{max_value} [{bar}] {percentage}%"
 
-    def __repr__(self):
-        return self.__str__()
 
-def scrape_data(url, worksheet, row):
+def scrape_data(url, thread_pool):
     response = requests.get(url)
 
     if response.status_code != 200:
@@ -45,58 +41,41 @@ def scrape_data(url, worksheet, row):
 
     soup = BeautifulSoup(response.text, 'html.parser')
 
-    # `result__name`(病院名)と`result-data__list`(住所、電話番号、最寄り駅、科)を取得
-    names = soup.find_all(class_='result__name')
-    data_lists = soup.find_all(class_='result-data')
+    page_info = HospitalFactory.from_html(soup, root_url)
 
-    # データを出力
-    for name, data_list in zip(names, data_lists):
-        name = name.get_text(strip=True)
+    # Thread safe bc only writing, not reading data which may be written at the same time
+    all_hospitals.extend(page_info.hospitals)
 
-        data_items = data_list.find_all('li')
+    max_hospitals.store(page_info.total_count)
 
-        # 1 - 住所
-        # 2 - 電話番号
-        # 3 - 最寄り駅
-        # 4 - 科
-        if (len(data_items) < 4):
-            print(f"Skippping {name}")
+    current_hospitals.add(len(page_info.hospitals))
+
+    print(get_progress_bar(current_hospitals.load(), max_hospitals.load(), 10), end="\r")
+
+    for page in page_info.pages_links:
+        if page[0] in visited_pages.keys():
             continue
+        
+        visited_pages[page[0]] = page[1]
 
-        address = data_items[0].get_text(strip=True)
-        phone = data_items[1].get_text(strip=True)
-        station = data_items[2].get_text(strip=True)
-        department = data_items[3].get_text(strip=True)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            executor.submit(scrape_data, page[1], executor)
 
-        hospital = Hospital(name, address, phone, station, department)
+        executor.shutdown(wait=True)
 
-        hospital.write_to_worksheet(worksheet, row)
 
-        row += 1
-
-        print("Scraped " + str(hospital))
-
-    pages = soup.find_all(class_='pagination__number')
-
+# 各URLからデータをスクレイピング
+for idx, url in enumerate(urls):
     try:
-        for page in pages:
-            page_number = page.get_text(strip=True)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            executor.submit(scrape_data, url, executor)
 
-            if page_number in pages or page.get('href') is None:
-                continue
+            executor.shutdown(wait=True)
 
-            pages.append(page_number)
-
-            next_url = f"{root_url}{page['href']}"
-
-            
-            scrape_data(next_url, worksheet, row)
     except KeyboardInterrupt as e:
-        return
-    except Exception as e:
-        print("Fuck " + e)
-        return
+        print("Exiting early...")
 
+print(f"Writing to '{output_file}'")
 
 workbook = xlsxwriter.Workbook('hospitals.xlsx')
 worksheet = workbook.add_worksheet()
@@ -107,13 +86,7 @@ worksheet.write('C1', '電話番号')
 worksheet.write('D1', '最寄り駅')
 worksheet.write('E1', '科')
 
-# 各URLからデータをスクレイピング
-for idx, url in enumerate(urls):
-    try:
-        scrape_data(url, worksheet, idx + 2)
-    except KeyboardInterrupt as e:
-        print("Exiting early...")
-    except Exception as e:
-        print("Fuck (2)" + e)
+for idx, hospital in enumerate(all_hospitals):
+    hospital.write_to_worksheet(worksheet, idx + 1)
 
 workbook.close()
